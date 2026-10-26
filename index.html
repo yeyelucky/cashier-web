@@ -817,10 +817,46 @@ const DEFAULT_PRODUCTS = {
   '6905678901234': { name: '乐事薯片 原味', price: 6.50, cost: 3.50, discount: 0.9, stock: 12, lowStock: 3 },
 };
 
-function loadJSON(key, fallback) {
-  try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : fallback; } catch(e) { return fallback; }
+// ===== 安全存储层 =====
+// 原理：localStorage 可能被浏览器禁用（隐私模式/禁用 Cookie/隐私扩展拦截 github.io 域）。
+// 直接调用 setItem 会抛 SecurityError 导致结账等流程中断、订单丢失。
+// 方案：内存对象 memoryStore 作为会话内数据源，localStorage 仅作持久化层；
+// 任何读写都包 try-catch，写入失败自动降级为"仅内存"，并在页面顶部显示警告横幅。
+const memoryStore = {};
+let storageAvailable = true;
+try {
+  localStorage.setItem('__storage_test__', '1');
+  localStorage.removeItem('__storage_test__');
+} catch (e) {
+  storageAvailable = false;
 }
-function saveJSON(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
+
+// 存储被禁时显示持久警告横幅
+function showStorageWarning() {
+  if (document.getElementById('storageWarnBanner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'storageWarnBanner';
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#c53030;color:#fff;padding:10px 16px;font-size:14px;text-align:center;font-weight:600;';
+  banner.innerHTML = '⚠️ 浏览器已禁用本地存储（localStorage）：数据仅保存在内存中，刷新/关闭页面即丢失。请在浏览器设置中允许本站点的 Cookie 和站点数据。';
+  document.body.appendChild(banner);
+}
+
+function loadJSON(key, fallback) {
+  // 会话内优先读内存（saveJSON 每次都同步写内存，保证读到最新值）
+  let s = (key in memoryStore) ? memoryStore[key] : null;
+  if (s == null) {
+    try { s = localStorage.getItem(key); } catch (e) { storageAvailable = false; }
+  }
+  try { return s ? JSON.parse(s) : fallback; } catch (e) { return fallback; }
+}
+function saveJSON(key, val) {
+  const s = JSON.stringify(val);
+  memoryStore[key] = s; // 永远先写内存，保证当前会话功能正常
+  try { localStorage.setItem(key, s); } catch (e) {
+    if (storageAvailable) { storageAvailable = false; showStorageWarning(); }
+  }
+}
+if (!storageAvailable) showStorageWarning();
 
 // 产品：兼容旧数据补齐 stock / lowStock / cost
 function loadProducts() {
