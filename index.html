@@ -363,6 +363,8 @@
   .toast.info { background: #4a90e2; }
   .toast.warn { background: #dd6b20; }
 </style>
+<!-- Supabase JS 客户端（云端存储：goods / sales_all / sales） -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 <div class="container">
@@ -858,6 +860,157 @@ function saveJSON(key, val) {
 }
 if (!storageAvailable) showStorageWarning();
 
+// ===== Supabase 云端同步层 =====
+// 说明：
+// 1. goods 云端表结构固定（barcode/name/price/qty），cost/profit/lowStock/discount 属本地敏感字段，不上云。
+// 2. 所有云端操作均为异步 fire-and-forget + try/catch：断网、未配置 key 时绝不影响收银主流程。
+// 3. 同步机制采用"快照对比"：saveProducts() 每次保存后对比上一次快照，
+//    自动识别新增/修改/删除的商品并推送云端——一处挂载，覆盖手动添加、行内编辑、
+//    库存修改、批量操作、CSV/Excel 导入、结账扣库存等全部场景。
+const SUPABASE_URL = 'https://rnqbahflxbxufwtxfksz.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJucWJhaGZseGJ4dWZ3dHhma3N6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwMTM5NjIsImV4cCI6MjEwODU4OTk2Mn0.RHQu1DSO3u2sWcgR4ksFZbpdGn0DE9TMoXaU6JawhBA';
+let sbClient = null;
+let cloudReady = false;
+let goodsSnapshot = {};   // barcode -> 签名串（name/price/stock），用于变更检测
+const cloudUpsertQueue = new Set();
+const cloudDeleteQueue = new Set();
+let cloudFlushTimer = null;
+
+// 左下角云状态徽标
+function setCloudBadge(state, detail) {
+  let b = document.getElementById('cloudBadge');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'cloudBadge';
+    b.style.cssText = 'position:fixed;left:10px;bottom:10px;z-index:9999;padding:4px 12px;border-radius:12px;font-size:12px;color:#fff;pointer-events:none;transition:background .3s;';
+    document.body.appendChild(b);
+  }
+  const map = {
+    off:   ['#a0aec0', '☁️ 云端未配置'],
+    conn:  ['#dd6b20', '☁️ 连接中…'],
+    on:    ['#38a169', '☁️ 云端已同步'],
+    error: ['#e53e3e', '☁️ 云端同步失败'],
+  };
+  const [color, text] = map[state] || map.off;
+  b.style.background = color;
+  b.textContent = detail ? text + '：' + detail : text;
+}
+
+// 商品 → 云端行（只取表结构固定字段）
+function toGoodsRow(b) {
+  const p = products[b];
+  return { barcode: b, name: p.name, price: p.price, qty: p.stock || 0 };
+}
+
+// 初始化：拉取云端商品并与本地合并
+async function cloudInit() {
+  if (!SUPABASE_ANON_KEY || !window.supabase) { setCloudBadge('off'); return; }
+  try {
+    sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    setCloudBadge('conn');
+    const { data, error } = await sbClient.from('goods').select('barcode,name,price,qty');
+    if (error) throw error;
+    const rows = data || [];
+    const cloudBarcodes = new Set(rows.map(r => r.barcode));
+
+    // 云端为准合并共享字段；本地独有的商品（离线期间新增）补推到云端
+    rows.forEach(r => {
+      if (products[r.barcode]) {
+        const p = products[r.barcode];
+        p.name = r.name; p.price = r.price; p.stock = r.qty; // 云端为准
+      } else {
+        products[r.barcode] = { name: r.name, price: r.price, cost: null, discount: 1, stock: r.qty, lowStock: 5 };
+      }
+    });
+    const localOnly = Object.keys(products).filter(b => !cloudBarcodes.has(b));
+    if (localOnly.length) {
+      await sbClient.from('goods').upsert(localOnly.map(toGoodsRow), { onConflict: 'barcode' });
+    }
+    // 初始化快照并持久化
+    Object.keys(products).forEach(b => { goodsSnapshot[b] = JSON.stringify([products[b].name, products[b].price, products[b].stock]); });
+    saveJSON('products', products);
+    render();
+    const pm = document.getElementById('productModal');
+    if (pm && pm.classList.contains('active')) renderProductList();
+    cloudReady = true;
+    setCloudBadge('on');
+  } catch (e) {
+    console.warn('云端初始化失败', e);
+    setCloudBadge('error', e.message || '');
+  }
+}
+
+// 快照对比：识别变更/删除，入队后防抖统一推送
+function cloudDiffAndPush() {
+  if (!cloudReady) return;
+  Object.keys(products).forEach(b => {
+    const sig = JSON.stringify([products[b].name, products[b].price, products[b].stock]);
+    if (goodsSnapshot[b] !== sig) { goodsSnapshot[b] = sig; if (!cloudDeleteQueue.has(b)) cloudUpsertQueue.add(b); }
+  });
+  Object.keys(goodsSnapshot).forEach(b => {
+    if (!products[b]) { delete goodsSnapshot[b]; cloudUpsertQueue.delete(b); cloudDeleteQueue.add(b); }
+  });
+  clearTimeout(cloudFlushTimer);
+  cloudFlushTimer = setTimeout(cloudFlush, 600);
+}
+async function cloudFlush() {
+  if (!cloudReady) return;
+  const ups = [...cloudUpsertQueue].filter(b => products[b]);
+  const dels = [...cloudDeleteQueue];
+  cloudUpsertQueue.clear(); cloudDeleteQueue.clear();
+  try {
+    if (ups.length) {
+      const { error } = await sbClient.from('goods').upsert(ups.map(toGoodsRow), { onConflict: 'barcode' });
+      if (error) throw error;
+    }
+    if (dels.length) {
+      const { error } = await sbClient.from('goods').delete().in('barcode', dels);
+      if (error) throw error;
+    }
+    if (ups.length || dels.length) setCloudBadge('on');
+  } catch (e) {
+    console.warn('云端推送失败', e);
+    setCloudBadge('error', e.message || '');
+  }
+}
+
+// 订单上云：sales_all（汇总一行）+ sales（商品明细每商品一行）
+async function cloudInsertOrder(order) {
+  if (!cloudReady) return;
+  try {
+    const orderNo = String(order.id);
+    const qty = order.items.reduce((s, i) => s + i.qty, 0);
+    const { error: e1 } = await sbClient.from('sales_all').insert({
+      order_no: orderNo, time: order.time,
+      total: order.total, cost: order.cost, profit: order.profit,
+      discount: order.discount, original: order.original, qty,
+    });
+    if (e1) throw e1;
+    const detailRows = order.items.map(i => ({
+      order_no: orderNo, time: order.time,
+      barcode: i.barcode, name: i.name, price: i.price,
+      discount: i.discount, qty: i.qty,
+      subtotal: +(i.price * i.discount * i.qty).toFixed(2),
+    }));
+    const { error: e2 } = await sbClient.from('sales').insert(detailRows);
+    if (e2) throw e2;
+    setCloudBadge('on');
+  } catch (e) {
+    console.warn('订单上云失败', e);
+    setCloudBadge('error', e.message || '');
+  }
+}
+
+// 订单删除同步上云（sales_all + sales 按 order_no 删）
+async function cloudDeleteOrder(orderId) {
+  if (!cloudReady) return;
+  const orderNo = String(orderId);
+  try {
+    await sbClient.from('sales').delete().eq('order_no', orderNo);
+    await sbClient.from('sales_all').delete().eq('order_no', orderNo);
+  } catch (e) { console.warn('订单云端删除失败', e); }
+}
+
 // 产品：兼容旧数据补齐 stock / lowStock / cost
 function loadProducts() {
   const saved = loadJSON('products', null);
@@ -874,7 +1027,7 @@ function loadProducts() {
   saveJSON('products', DEFAULT_PRODUCTS);
   return JSON.parse(JSON.stringify(DEFAULT_PRODUCTS));
 }
-function saveProducts() { saveJSON('products', products); }
+function saveProducts() { saveJSON('products', products); cloudDiffAndPush(); }
 
 let products = loadProducts();
 let orders = loadJSON('orders') || []; // 必须兜底空数组：线上首次访问无历史数据时，undefined 会导致结账 orders.push() 崩溃
@@ -1095,6 +1248,7 @@ function doCheckout() {
     profit: +totalProfit.toFixed(2),
   };
   orders.push(order); saveJSON('orders', orders);
+  cloudInsertOrder(order); // 订单同步上云（sales_all + sales）
 
   // 提醒低库存
   const lowStockAfter = itemsCopy.filter(i => {
@@ -2569,11 +2723,14 @@ function deleteOrder(id) {
   if (!confirm('确定删除这笔订单记录？')) return;
   orders = orders.filter(o => String(o.id) !== String(id));
   saveJSON('orders', orders); renderOrderList(); toast('🗑️ 订单已删除', 'info');
+  cloudDeleteOrder(id);
 }
 function clearAllOrders() {
   if (orders.length === 0) return;
   if (!confirm('⚠️ 确定清空所有订单记录？不可恢复！')) return;
+  const ids = orders.map(o => o.id);
   orders = []; saveJSON('orders', orders); renderOrderList(); toast('🗑️ 已清空', 'warn');
+  ids.forEach(id => cloudDeleteOrder(id));
 }
 
 function exportCSV() {
@@ -2644,6 +2801,7 @@ document.addEventListener('DOMContentLoaded', () => {
   tick(); setInterval(tick, 1000);
 
   render(); renderDiscountPresets(); input.focus();
+  cloudInit(); // 连接 Supabase 云端（未配置 key 时自动跳过）
 });
 
 ['productModal', 'pwdModal', 'dashboardModal', 'checkoutModal', 'holdModal', 'discountModal', 'productDetailModal', 'profitFormulaModal', 'stockEditModal'].forEach(id => {
