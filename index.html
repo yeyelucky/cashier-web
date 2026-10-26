@@ -877,7 +877,7 @@ function loadProducts() {
 function saveProducts() { saveJSON('products', products); }
 
 let products = loadProducts();
-let orders = loadJSON('orders');
+let orders = loadJSON('orders') || []; // 必须兜底空数组：线上首次访问无历史数据时，undefined 会导致结账 orders.push() 崩溃
 let currentPwd = loadJSON('pwd') || '1234';
 let costUnlocked = false;
 let cart = [];
